@@ -14,7 +14,7 @@ A continuous-time generative framework built on **Optimal Transport Flow Matchin
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
+git clone git@github.com:serh1m/DITSB.git
 cd DITSB
 
 # Install the package in editable mode
