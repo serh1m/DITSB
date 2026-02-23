@@ -12,12 +12,14 @@ The loss drives the learned vector field v_θ(z_t, t) towards u_t under MSE.
 
 import torch
 import torch.nn as nn
+from .sinkhorn_ot import sample_sinkhorn_coupled
 
 
 def optimal_transport_loss(
     vector_field: nn.Module,
     real_data: torch.Tensor,
     sigma_min: float = 1e-5,
+    ot_coupling: str = "sinkhorn",
 ) -> torch.Tensor:
     """
     Parameters
@@ -42,6 +44,10 @@ def optimal_transport_loss(
 
     # 2. Target data z₁
     z_1 = real_data
+
+    # 3. Apply coupling (Entropic Minibatch OT vs Random)
+    if ot_coupling == "sinkhorn":
+        z_0, z_1 = sample_sinkhorn_coupled(z_0, z_1)
 
     # 3. Random time t ~ U[0, 1]
     t = torch.rand(batch_size, device=device, dtype=dtype)

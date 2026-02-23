@@ -25,6 +25,7 @@ from typing import Optional
 
 from .flow import DITSB_GenerativeFlow
 from .loss import optimal_transport_loss
+from .sinkhorn_ot import sample_sinkhorn_coupled
 
 
 def compute_straightness(
@@ -67,6 +68,7 @@ def generate_reflow_pairs(
     state_dim: int,
     device: torch.device,
     steps: int = 100,
+    ot_coupling: str = "sinkhorn",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Generate (z_0, z_1) coupling pairs by running the teacher model.
@@ -83,6 +85,12 @@ def generate_reflow_pairs(
         t_span = torch.linspace(0, 1, steps=steps, device=device)
         trajectory = flow_model(z_0, t_span)
         z_1 = trajectory[-1]
+        
+        if ot_coupling == "sinkhorn":
+            # During reflow distillation, we want to match the generated data back to its most logical geometric noise source 
+            # instead of assuming the identity mapping. 
+            z_0, z_1 = sample_sinkhorn_coupled(z_0, z_1)
+            
     return z_0, z_1
 
 
@@ -168,6 +176,7 @@ class RectifiedFlowTrainer:
         teacher_ode_steps: int = 100,
         verbose: bool = True,
         early_stop_straightness_drop: float = 0.1,
+        ot_coupling: str = "sinkhorn",
     ) -> list[float]:
         """
         Run reflow distillation iterations.
@@ -186,7 +195,7 @@ class RectifiedFlowTrainer:
                 print(f"  Generating {num_pairs} coupling pairs ...")
             z_0_all, z_1_all = generate_reflow_pairs(
                 self.teacher_flow, num_pairs, self.state_dim,
-                self.device, steps=teacher_ode_steps,
+                self.device, steps=teacher_ode_steps, ot_coupling=ot_coupling
             )
 
             # Measure straightness before reflow

@@ -157,3 +157,48 @@ class DiscreteFlowField(nn.Module):
         h = self.ln_out(h)
         logits = self.head(h)                                 # (B, L, V)
         return logits
+
+class CategoricalFlowMatcher(nn.Module):
+    """
+    Continuous-Time Markov Chain (CTMC) Flow for Probability Simplices.
+    Designed to solve the continuous-to-discrete truncation mismatch for tokens.
+    """
+    def __init__(self, vocab_size: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        
+        # Base Prior is a uniform Dirichlet distribution
+        # Equivalent to maximum entropy on the simplex
+        self.register_buffer("prior_alpha", torch.ones(vocab_size))
+
+    def sample_pt(self, x1_onehot: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the target probability state at time t.
+        At t=0: pt = Uniform (1/V)
+        At t=1: pt = Dirac(x1)
+        """
+        uniform_prior = torch.ones_like(x1_onehot) / self.vocab_size
+        return (1 - t) * uniform_prior + t * x1_onehot
+
+    def compute_ctmc_loss(self, logits_theta: torch.Tensor, x1_onehot: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        The DITSB-v2 Discrete Flow Training Objective.
+        Instead of matching vector field v = x1 - x0,
+        We match the predicted transition rate (logits) to the conditional derivative
+        of the simplex probability path.
+        """
+        uniform_prior = torch.ones_like(x1_onehot) / self.vocab_size
+        target_rate = x1_onehot - uniform_prior 
+        probs_theta = torch.nn.functional.softmax(logits_theta, dim=-1)
+        return torch.nn.functional.mse_loss(probs_theta, target_rate + uniform_prior)
+
+    @torch.no_grad()
+    def euler_step_discrete(self, probs: torch.Tensor, logits_theta: torch.Tensor, dt: float) -> torch.Tensor:
+        """
+        Steps the probability vector forward in time directly on the simplex.
+        """
+        rates = torch.nn.functional.softmax(logits_theta, dim=-1)
+        dp_dt = rates - (torch.ones_like(rates) / self.vocab_size)
+        probs_next = probs + dp_dt * dt
+        probs_next = torch.clamp(probs_next, min=1e-7)
+        return probs_next / probs_next.sum(dim=-1, keepdim=True)
