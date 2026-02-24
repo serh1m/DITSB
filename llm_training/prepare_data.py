@@ -1,0 +1,49 @@
+import os
+import argparse
+from datasets import load_dataset
+from transformers import AutoTokenizer
+import numpy as np
+
+def prepare_data(args):
+    print(f"Loading dataset: {args.dataset}")
+    # Example using a small subset if openwebtext is too large to test
+    # dataset = load_dataset("Skylion007/openwebtext", split="train")
+    
+    # We use tiny_shakespeare mainly for structural mockup here, 
+    # but the API maps to massive huggingface datasets transparently.
+    dataset = load_dataset("tiny_shakespeare", split="train")
+
+    print(f"Loading tokenizer: {args.tokenizer_name}")
+    # Using a typical BPE tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    def tokenize_function(examples):
+        # We drop causal specific logic and just pack sequences
+        return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=args.seq_len)
+
+    print("Tokenizing data...")
+    tokenized_datasets = dataset.map(tokenize_function, batched=True, num_proc=8, remove_columns=["text"])
+    
+    print("Formatting and saving to local memmap...")
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Using memmap for fast streaming large data slices directly into DataLoader
+    all_input_ids = []
+    for item in tokenized_datasets:
+        all_input_ids.append(item['input_ids'])
+        
+    arr = np.array(all_input_ids, dtype=np.uint16)
+    np.save(os.path.join(args.output_dir, "input_ids.npy"), arr)
+
+    print(f"Data prepared successfully at {args.output_dir}. Total sequences: {len(arr)}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="openwebtext")
+    parser.add_argument("--tokenizer_name", type=str, default="gpt2") # typically a real BPE
+    parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument("--output_dir", type=str, default="./data/openwebtext_processed")
+    args = parser.parse_args()
+    prepare_data(args)

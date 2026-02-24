@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .discrete_flow import CategoricalFlowMatcher
+
 
 def discrete_flow_matching_loss(
     model: nn.Module,
@@ -66,18 +68,13 @@ def discrete_flow_matching_loss(
     # 3. Forward pass: predict clean tokens
     logits = model(x_t, t)                                 # (B, L, V)
 
-    # 4. Cross-entropy loss
-    # Fix BUG-3: Compute loss ONLY on corrupted positions.
-    # Training on identity mapping (clean->clean) wastes capacity.
+    # 4. Use the new DITSB-v2 CTMC Exact Flow Loss
+    ctmc = CategoricalFlowMatcher(vocab_size).to(device)
+    x1_onehot = F.one_hot(x_1, num_classes=vocab_size).float()
     
-    loss_unreduced = F.cross_entropy(
-        logits.reshape(-1, vocab_size), 
-        x_1.reshape(-1), 
-        reduction="none"
-    )
-    loss_unreduced = loss_unreduced.reshape(B, L)
+    # We pass logits, onehot, and time (time is not actively used in the simplified v2 base, but kept for signature)
+    t_expanded = t.view(B, 1, 1).expand(B, L, 1)
     
-    # Mask out loss on uncorrupted tokens
-    loss = (loss_unreduced * corrupt_mask.float()).sum() / corrupt_mask.sum().clamp(min=1)
+    loss_unreduced = ctmc.compute_ctmc_loss(logits, x1_onehot, t_expanded)
 
-    return loss
+    return loss_unreduced

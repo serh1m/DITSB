@@ -1,0 +1,44 @@
+model:
+  type: "DITSB-Flow-Transformer"
+  d_model: 4096
+  n_heads: 32
+  n_layers: 32
+  vocab_size: 128256 # example for LLaMA 3 vocab
+  max_seq_len: 2048  # The context length mapped as flow dimension
+  dropout: 0.0
+
+flow:
+  framework: "CTMC"
+  sinkhorn_epsilon: 0.05
+  sinkhorn_iters: 20
+  ode_solver: "rk4" # For evaluation. Training uses flow-matching regression.
+  implicit_solver_stages: 2 # For implicit Gauss-Legendre step decoding
+  adjoint_method: true 
+
+training:
+  batch_size: 4
+  grad_accum_steps: 8
+  learning_rate: 3e-4
+  weight_decay: 0.1
+  warmup_steps: 2000
+  max_steps: 100000
+  checkpoint_dir: "./checkpoints/ditsb-7b"
+  mixed_precision: "bf16"
+  clip_grad_norm: 1.0 # Added: Prevent exploding gradients in CTMC mapping
+
+hardware:
+  num_nodes: 1
+  gpus_per_node: 8
+  gpu_type: "H100" # Assumed TFLOPS: ~989 TFLOPS bf16 with sparsity
+  utilization_factor: 0.45 # MFU (Model FLOPs Utilization)
+
+logging:
+  log_interval: 10       # Print logs every 10 steps
+  eval_interval: 1000    # Evaluate every 1000 steps
+  save_interval: 5000    # Save checkpoint every 5000 steps
+  wandb_project: "DITSB-7B"
+
+data:
+  dataset_dir: "./data/openwebtext_processed"
+  num_workers: 8
+  tokens_per_epoch: 300_000_000_000 # 300B Tokens target
