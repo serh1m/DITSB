@@ -17,6 +17,9 @@ logging.basicConfig(
 logger = logging.getLogger("DITSB-Train")
 
 # Assume ditsb is installed or in PYTHONPATH
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+
 try:
     from ditsb.discrete_flow import CategoricalFlowMatcher
 except ImportError:
