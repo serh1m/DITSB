@@ -175,7 +175,15 @@ class DITSBFlowLLaMA(nn.Module):
         self.lm_head = nn.Linear(self.d_model, self.vocab, bias=False)
         
     def forward(self, t, x_t_probs):
-        x = self.soft_embedding(x_t_probs)
+        # CRITICAL FIX: The soft embedding matrix dot product requires computing the sum of 128,256 items. 
+        # Under float16, summing this many elements completely destroys the mantissa and outputs NaNs.
+        # Run explicitly in float32 then cast back.
+        with torch.autocast('cuda', enabled=False):
+            x = torch.nn.functional.linear(
+                x_t_probs.to(torch.float32), 
+                self.soft_embedding.weight.to(torch.float32)
+            ).to(self.soft_embedding.weight.dtype)
+
         
         if isinstance(t, float) or t.dim() == 0:
             t_vec = torch.full((x_t_probs.size(0), x_t_probs.size(1), 1), float(t), device=x_t_probs.device, dtype=x.dtype)
@@ -346,6 +354,9 @@ def train(config_path, warm_start_path=None):
     logger.info("🚀 Starting O(1) Adjoint Sinkhorn Flow Training Loop")
     logger.info("="*60)
     
+    # Initialize Gradient Scaler for standard Float16 (T4 GPUs) to prevent gradient tracking underflow
+    scaler = torch.amp.GradScaler('cuda', enabled=(target_dtype == torch.float16))
+    
     model.train()
     start_time = time.time()
     last_log_time = start_time
@@ -378,20 +389,21 @@ def train(config_path, warm_start_path=None):
         
         optimizer.zero_grad(set_to_none=True) # Memory efficient zeroing
         
-        # Mixed Precision Forward/Backward (BFloat16 natively prevents underflow without a Scaler)
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        # Mixed Precision Forward/Backward
+        with torch.amp.autocast('cuda', dtype=target_dtype):
             # Forward Vector Field 
             logits = model(t, pt)
             
             # CE over probability transition conditionals
             loss = matcher.compute_ctmc_loss(logits, x1_onehot, t)
             
-        loss.backward()
+        scaler.scale(loss).backward()
         
         # Address vanishing/exploding gradients in Flow spaces
+        scaler.unscale_(optimizer)
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
         
-        # Protective Guard: Do not step if gradients exploded to NaN/Inf during BFloat16 transitions
+        # Protective Guard: Do not step if gradients exploded to NaN/Inf during BFloat16/FP16 transitions
         loss_val = loss.item()
         if math.isnan(grad_norm) or math.isinf(grad_norm) or math.isnan(loss_val) or math.isinf(loss_val):
             logger.warning(f"Step {step}: NaN/Inf detected (Loss: {loss_val:.2f}, Grad: {grad_norm}). Skipping step metrics and parameter update.")
@@ -400,7 +412,8 @@ def train(config_path, warm_start_path=None):
             step -= 1
             continue
         else:
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             accumulated_loss += loss_val
         
