@@ -175,9 +175,18 @@ def train(config_path, warm_start_path=None):
     )
     logger.info(f"Dataset loaded. Total continuous chunks: {len(dataset):,}")
     
-    # 2. Model & Optimization setup
-    model = DITSBFlowLLaMA(config).to(device)
+    # 2. Model & Optimization setup (CRITICAL MEMORY PRESERVATION: Initialize directly on device in bfloat16 to avoid 28GB CPU/GPU spike)
+    logger.info("Instantiating DITSB LLM Architecture (Native half-precision on device)...")
+    old_dtype = torch.get_default_dtype()
+    # Force 16-bit to instantly halve 7B parameter allocation (28GB -> 14GB)
+    target_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    torch.set_default_dtype(target_dtype) 
     
+    # Note: On PyTorch 2.x, device context manager prevents host CPU RAM exhaustion
+    with torch.device(device):
+        model = DITSBFlowLLaMA(config)
+    
+    torch.set_default_dtype(old_dtype) # Restore defaults
     # 2.5 Optional Warm-Start
     if warm_start_path:
         logger.info("Initializing Warm-Start from pre-trained weights.")
