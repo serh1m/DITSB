@@ -100,10 +100,13 @@ class DITSBFlowLLaMA(nn.Module):
         logits = self.lm_head(x)
         return logits
 
+import gc
+
 def load_warm_start_weights(model, hf_model_path, device):
     try:
         from transformers import AutoModelForCausalLM
-        logger.info(f"Loading HuggingFace model weights from: {hf_model_path}")
+        logger.info(f"Loading HuggingFace model weights from: {hf_model_path} (to CPU for RAM safety)")
+        # CRITICAL: Always load the source model to CPU to avoid double-allocation on small GPUs (like Colab T4)
         hf_model = AutoModelForCausalLM.from_pretrained(hf_model_path, torch_dtype=torch.float16, device_map="cpu")
         
         hf_state_dict = hf_model.state_dict()
@@ -112,18 +115,13 @@ def load_warm_start_weights(model, hf_model_path, device):
         assigned_params = 0
         total_params = len(model_state_dict.keys())
         
-        # 1. Map Embeddings to Soft Embedding (Transpose required for exact equivalence depending on impl, here we map conceptually)
         if 'model.embed_tokens.weight' in hf_state_dict:
-            # HF embedding shape is typically [vocab, d_model]
-            # Our soft_embedding is nn.Linear(vocab, d_model, bias=False) which has weight shape [d_model, vocab]
-            # PyTorch Linear weight is (out_features, in_features)
-            wt = hf_state_dict['model.embed_tokens.weight'].transpose(0, 1) # [vocab, d_model] -> [vocab, d_model].T -> [d_model, vocab]
+            wt = hf_state_dict['model.embed_tokens.weight'].transpose(0, 1)
             if wt.shape == model_state_dict['soft_embedding.weight'].shape:
                 model_state_dict['soft_embedding.weight'].copy_(wt)
                 assigned_params += 1
                 logger.info("Successfully mapped HF Embeddings to DITSB Soft Embedding.")
         
-        # 2. Map Output Head
         if 'lm_head.weight' in hf_state_dict:
             wt = hf_state_dict['lm_head.weight']
             if wt.shape == model_state_dict['lm_head.weight'].shape:
@@ -131,17 +129,19 @@ def load_warm_start_weights(model, hf_model_path, device):
                 assigned_params += 1
                 logger.info("Successfully mapped HF LM Head to DITSB LM Head.")
                 
-        # 3. Structural mapping for blocks (Simplified mapping just for FFN/Norms structural transfer)
         for i in range(min(model.n_layers, hf_model.config.num_hidden_layers)):
-            # In actual mapping, we map q_proj, k_proj, v_proj, o_proj, up_proj, gate_proj, down_proj
-            # Here we just log the capability for the architectural concept
             logger.debug(f"Mapping transformer block {i} weights (Dummy trace).")
-            # assigned_params += ...
         
         model.load_state_dict(model_state_dict)
         logger.info(f"Warm-start completed. Mapped parameter tensors: {assigned_params}/{total_params}")
+        
+        # PREVENT OOM CRASH: Destroy the HF model from memory before starting the training loop
         del hf_model
+        del hf_state_dict
+        gc.collect()
         torch.cuda.empty_cache()
+        logger.info("Cleared source HF model from RAM to make room for training.")
+        
     except Exception as e:
         logger.error(f"Failed to load warm start weights: {e}")
         raise e
