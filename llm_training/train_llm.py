@@ -234,7 +234,17 @@ def train(config_path, warm_start_path=None):
     
     torch.cuda.empty_cache()
     
-    for step, batch in enumerate(loader, 1):
+    def infinite_loader(dl):
+        while True:
+            for b in dl:
+                yield b
+                
+    step = 0
+    for batch in infinite_loader(loader):
+        step += 1
+        if step > max_steps:
+            break
+            
         batch = batch.to(device)
         B, SeqLen = batch.shape
         vocab = config['model']['vocab_size']
