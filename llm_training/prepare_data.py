@@ -24,18 +24,36 @@ def prepare_data(args):
         tokenizer.pad_token = tokenizer.eos_token
 
     def tokenize_function(examples):
-        # We drop causal specific logic and just pack sequences
-        return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=args.seq_len)
+        # Do not pad or truncate here; just convert text to tokens
+        return tokenizer(examples["text"], truncation=False)
 
     print("Tokenizing data...")
     tokenized_datasets = dataset.map(tokenize_function, batched=True, num_proc=8, remove_columns=["text"])
     
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        
+        # We drop the small remainder, making sure each sequence is precisely `args.seq_len` long with zero padding!
+        total_length = (total_length // args.seq_len) * args.seq_len
+        
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + args.seq_len] for i in range(0, total_length, args.seq_len)]
+            for k, t in concatenated_examples.items()
+        }
+        return result
+
+    print("Packing token sequences continuously (Zero Padding)...")
+    packed_datasets = tokenized_datasets.map(group_texts, batched=True, num_proc=8)
+
     print("Formatting and saving to local memmap...")
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Using memmap for fast streaming large data slices directly into DataLoader
     all_input_ids = []
-    for item in tokenized_datasets:
+    for item in packed_datasets:
         all_input_ids.append(item['input_ids'])
         
     arr = np.array(all_input_ids, dtype=np.uint16)
