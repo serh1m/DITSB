@@ -46,6 +46,112 @@ class LLMDataset(Dataset):
 
 import argparse
 
+import torch
+import torch.nn as nn
+import math
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps) * self.weight
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=8192, base=500000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        t = torch.arange(max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().bfloat16(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().bfloat16(), persistent=False)
+
+    def forward(self, seq_len):
+        return self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(2), self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(2)
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+class Attention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_heads = config['model'].get('n_heads', 32)
+        self.n_kv_heads = config['model'].get('n_kv_heads', 8)
+        self.d_model = config['model']['d_model']
+        self.head_dim = self.d_model // self.n_heads
+        
+        self.q_proj = nn.Linear(self.d_model, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, self.d_model, bias=False)
+        self.rotary = RotaryEmbedding(self.head_dim, max_position_embeddings=config['model'].get('max_seq_len', 2048))
+
+    def forward(self, x):
+        B, seq_len, _ = x.shape
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        
+        q = q.view(B, seq_len, self.n_heads, self.head_dim)
+        k = k.view(B, seq_len, self.n_kv_heads, self.head_dim)
+        v = v.view(B, seq_len, self.n_kv_heads, self.head_dim)
+        
+        cos, sin = self.rotary(seq_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        # GQA repeat
+        n_rep = self.n_heads // self.n_kv_heads
+        k = k[:, :, :, None, :].expand(B, seq_len, self.n_kv_heads, n_rep, self.head_dim).reshape(B, seq_len, self.n_heads, self.head_dim)
+        v = v[:, :, :, None, :].expand(B, seq_len, self.n_kv_heads, n_rep, self.head_dim).reshape(B, seq_len, self.n_heads, self.head_dim)
+        
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # No causal mask for bidirectional continuous flow!
+        attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, seq_len, self.n_heads * self.head_dim)
+        return self.o_proj(attn_output)
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.d_model = config['model']['d_model']
+        self.intermediate_size = config['model'].get('intermediate_size', 14336)
+        
+        self.gate_proj = nn.Linear(self.d_model, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.d_model, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.d_model, bias=False)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x):
+        # LLaMA SwiGLU logic: down_proj(act_fn(gate_proj(x)) * up_proj(x))
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+class LLaMABlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.input_layernorm = RMSNorm(config['model']['d_model'])
+        self.self_attn = Attention(config)
+        self.post_attention_layernorm = RMSNorm(config['model']['d_model'])
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.self_attn(self.input_layernorm(x))
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
+
 class DITSBFlowLLaMA(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -53,48 +159,31 @@ class DITSBFlowLLaMA(nn.Module):
         self.vocab = config['model']['vocab_size']
         self.n_layers = config['model'].get('n_layers', 32)
         
-        # Soft Embedding layer for mapping probability distributions
         self.soft_embedding = nn.Linear(self.vocab, self.d_model, bias=False)
         
-        # Additional weights for continuous flow 't'
         self.time_embed = nn.Sequential(
             nn.Linear(1, self.d_model),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(self.d_model, self.d_model)
         )
         
-        # Simple representation of Transformer Blocks
-        # (In a real implementation, this would be a custom Bidirectional Block)
-        self.blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.d_model, self.d_model * 4),
-                nn.GELU(),
-                nn.Linear(self.d_model * 4, self.d_model),
-                nn.LayerNorm(self.d_model)
-            ) for _ in range(self.n_layers)
-        ])
-        
-        self.norm = nn.LayerNorm(self.d_model)
+        self.blocks = nn.ModuleList([LLaMABlock(config) for _ in range(self.n_layers)])
+        self.norm = RMSNorm(self.d_model)
         self.lm_head = nn.Linear(self.d_model, self.vocab, bias=False)
         
     def forward(self, t, x_t_probs):
-        # 1. Soft Embedding of continuous probabilities
         x = self.soft_embedding(x_t_probs)
         
-        # 2. Time embeddings
         if isinstance(t, float) or t.dim() == 0:
-            t_vec = torch.full((x_t_probs.size(0), x_t_probs.size(1), 1), t, device=x_t_probs.device)
+            t_vec = torch.full((x_t_probs.size(0), x_t_probs.size(1), 1), float(t), device=x_t_probs.device, dtype=x.dtype)
         else:
-            t_vec = t
+            t_vec = t.to(x.dtype)
             
         t_emb = self.time_embed(t_vec)
-        
-        # 3. Additive injection of time (Simplified)
         x = x + t_emb
         
-        # 4. Bidirectional processing
         for block in self.blocks:
-            x = x + block(x) # Residual connection
+            x = block(x)
             
         x = self.norm(x)
         logits = self.lm_head(x)
@@ -129,11 +218,38 @@ def load_warm_start_weights(model, hf_model_path, device):
                 assigned_params += 1
                 logger.info("Successfully mapped HF LM Head to DITSB LM Head.")
                 
-        for i in range(min(model.n_layers, hf_model.config.num_hidden_layers)):
-            logger.debug(f"Mapping transformer block {i} weights (Dummy trace).")
+        if 'model.norm.weight' in hf_state_dict:
+            wt = hf_state_dict['model.norm.weight']
+            model_state_dict['norm.weight'].copy_(wt)
+            assigned_params += 1
+            logger.info("Successfully mapped HF final RMSNorm.")
+
+        num_layers = min(model.n_layers, hf_model.config.num_hidden_layers)
+        logger.info(f"Mapping {num_layers} Transformer Blocks...")
+        for i in range(num_layers):
+            block_prefix_hf = f"model.layers.{i}."
+            block_prefix_ditsb = f"blocks.{i}."
+            
+            mapping = {
+                f"{block_prefix_hf}input_layernorm.weight": f"{block_prefix_ditsb}input_layernorm.weight",
+                f"{block_prefix_hf}post_attention_layernorm.weight": f"{block_prefix_ditsb}post_attention_layernorm.weight",
+                f"{block_prefix_hf}self_attn.q_proj.weight": f"{block_prefix_ditsb}self_attn.q_proj.weight",
+                f"{block_prefix_hf}self_attn.k_proj.weight": f"{block_prefix_ditsb}self_attn.k_proj.weight",
+                f"{block_prefix_hf}self_attn.v_proj.weight": f"{block_prefix_ditsb}self_attn.v_proj.weight",
+                f"{block_prefix_hf}self_attn.o_proj.weight": f"{block_prefix_ditsb}self_attn.o_proj.weight",
+                f"{block_prefix_hf}mlp.gate_proj.weight": f"{block_prefix_ditsb}mlp.gate_proj.weight",
+                f"{block_prefix_hf}mlp.up_proj.weight": f"{block_prefix_ditsb}mlp.up_proj.weight",
+                f"{block_prefix_hf}mlp.down_proj.weight": f"{block_prefix_ditsb}mlp.down_proj.weight",
+            }
+            
+            for hf_key, ditsb_key in mapping.items():
+                if hf_key in hf_state_dict and ditsb_key in model_state_dict:
+                    if hf_state_dict[hf_key].shape == model_state_dict[ditsb_key].shape:
+                        model_state_dict[ditsb_key].copy_(hf_state_dict[hf_key])
+                        assigned_params += 1
         
         model.load_state_dict(model_state_dict)
-        logger.info(f"Warm-start completed. Mapped parameter tensors: {assigned_params}/{total_params}")
+        logger.info(f"Warm-start completed. Tensors Transferred: {assigned_params}/{total_params}")
         
         # PREVENT OOM CRASH: Destroy the HF model from memory before starting the training loop
         del hf_model
