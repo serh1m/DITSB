@@ -215,6 +215,14 @@ def train(config_path, warm_start_path=None):
     log_interval = config['logging']['log_interval']
     clip_grad_norm = config['training'].get('clip_grad_norm', 1.0)
     
+    # 2.6 Initialize Learning Rate Scheduler (Cosine Annealing)
+    initial_lr_float = float(config['training']['learning_rate'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=max_steps, 
+        eta_min=initial_lr_float * 0.1 # Decay down to 10% of starting LR
+    )
+    
     logger.info("="*60)
     logger.info("🚀 Starting O(1) Adjoint Sinkhorn Flow Training Loop")
     logger.info("="*60)
@@ -246,7 +254,7 @@ def train(config_path, warm_start_path=None):
             # Forward Vector Field 
             logits = model(t, pt)
             
-            # MSE over probability transition derivatives
+            # CE over probability transition conditionals
             loss = matcher.compute_ctmc_loss(logits, x1_onehot, t)
             
         loss.backward()
@@ -255,6 +263,7 @@ def train(config_path, warm_start_path=None):
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
         
         optimizer.step()
+        scheduler.step()
         
         accumulated_loss += loss.item()
         
