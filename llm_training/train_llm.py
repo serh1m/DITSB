@@ -44,26 +44,107 @@ class LLMDataset(Dataset):
     def __getitem__(self, idx):
         return torch.tensor(self.data[idx], dtype=torch.long)
 
+import argparse
+
 class DITSBFlowLLaMA(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.d_model = config['model']['d_model']
         self.vocab = config['model']['vocab_size']
-        self.net = nn.Sequential(
-            nn.Linear(self.vocab + 1, self.d_model),
+        self.n_layers = config['model'].get('n_layers', 32)
+        
+        # Soft Embedding layer for mapping probability distributions
+        self.soft_embedding = nn.Linear(self.vocab, self.d_model, bias=False)
+        
+        # Additional weights for continuous flow 't'
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, self.d_model),
             nn.GELU(),
-            nn.Linear(self.d_model, self.vocab)
+            nn.Linear(self.d_model, self.d_model)
         )
         
+        # Simple representation of Transformer Blocks
+        # (In a real implementation, this would be a custom Bidirectional Block)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.d_model, self.d_model * 4),
+                nn.GELU(),
+                nn.Linear(self.d_model * 4, self.d_model),
+                nn.LayerNorm(self.d_model)
+            ) for _ in range(self.n_layers)
+        ])
+        
+        self.norm = nn.LayerNorm(self.d_model)
+        self.lm_head = nn.Linear(self.d_model, self.vocab, bias=False)
+        
     def forward(self, t, x_t_probs):
+        # 1. Soft Embedding of continuous probabilities
+        x = self.soft_embedding(x_t_probs)
+        
+        # 2. Time embeddings
         if isinstance(t, float) or t.dim() == 0:
             t_vec = torch.full((x_t_probs.size(0), x_t_probs.size(1), 1), t, device=x_t_probs.device)
         else:
             t_vec = t
             
-        x_in = torch.cat([x_t_probs, t_vec], dim=-1)
-        logits = self.net(x_in)
+        t_emb = self.time_embed(t_vec)
+        
+        # 3. Additive injection of time (Simplified)
+        x = x + t_emb
+        
+        # 4. Bidirectional processing
+        for block in self.blocks:
+            x = x + block(x) # Residual connection
+            
+        x = self.norm(x)
+        logits = self.lm_head(x)
         return logits
+
+def load_warm_start_weights(model, hf_model_path, device):
+    try:
+        from transformers import AutoModelForCausalLM
+        logger.info(f"Loading HuggingFace model weights from: {hf_model_path}")
+        hf_model = AutoModelForCausalLM.from_pretrained(hf_model_path, torch_dtype=torch.float16, device_map="cpu")
+        
+        hf_state_dict = hf_model.state_dict()
+        model_state_dict = model.state_dict()
+        
+        assigned_params = 0
+        total_params = len(model_state_dict.keys())
+        
+        # 1. Map Embeddings to Soft Embedding (Transpose required for exact equivalence depending on impl, here we map conceptually)
+        if 'model.embed_tokens.weight' in hf_state_dict:
+            # HF embedding shape is typically [vocab, d_model]
+            # Our soft_embedding is nn.Linear(vocab, d_model, bias=False) which has weight shape [d_model, vocab]
+            # PyTorch Linear weight is (out_features, in_features)
+            wt = hf_state_dict['model.embed_tokens.weight'].transpose(0, 1) # [vocab, d_model] -> [vocab, d_model].T -> [d_model, vocab]
+            if wt.shape == model_state_dict['soft_embedding.weight'].shape:
+                model_state_dict['soft_embedding.weight'].copy_(wt)
+                assigned_params += 1
+                logger.info("Successfully mapped HF Embeddings to DITSB Soft Embedding.")
+        
+        # 2. Map Output Head
+        if 'lm_head.weight' in hf_state_dict:
+            wt = hf_state_dict['lm_head.weight']
+            if wt.shape == model_state_dict['lm_head.weight'].shape:
+                model_state_dict['lm_head.weight'].copy_(wt)
+                assigned_params += 1
+                logger.info("Successfully mapped HF LM Head to DITSB LM Head.")
+                
+        # 3. Structural mapping for blocks (Simplified mapping just for FFN/Norms structural transfer)
+        for i in range(min(model.n_layers, hf_model.config.num_hidden_layers)):
+            # In actual mapping, we map q_proj, k_proj, v_proj, o_proj, up_proj, gate_proj, down_proj
+            # Here we just log the capability for the architectural concept
+            logger.debug(f"Mapping transformer block {i} weights (Dummy trace).")
+            # assigned_params += ...
+        
+        model.load_state_dict(model_state_dict)
+        logger.info(f"Warm-start completed. Mapped parameter tensors: {assigned_params}/{total_params}")
+        del hf_model
+        torch.cuda.empty_cache()
+    except Exception as e:
+        logger.error(f"Failed to load warm start weights: {e}")
+        raise e
 
 def calculate_eta(elapsed_time, current_step, total_steps):
     if current_step == 0: return "Unknown"
@@ -72,7 +153,7 @@ def calculate_eta(elapsed_time, current_step, total_steps):
     eta_seconds = steps_left * time_per_step
     return time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
 
-def train(config_path):
+def train(config_path, warm_start_path=None):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -96,6 +177,12 @@ def train(config_path):
     
     # 2. Model & Optimization setup
     model = DITSBFlowLLaMA(config).to(device)
+    
+    # 2.5 Optional Warm-Start
+    if warm_start_path:
+        logger.info("Initializing Warm-Start from pre-trained weights.")
+        load_warm_start_weights(model, warm_start_path, device)
+    
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=float(config['training']['learning_rate']),
@@ -185,6 +272,9 @@ def train(config_path):
     logger.info("🎉 Training Complete.")
 
 if __name__ == "__main__":
-    import sys
-    config_file = sys.argv[1] if len(sys.argv) > 1 else "config_7b.yaml"
-    train(config_file)
+    parser = argparse.ArgumentParser(description="DITSB-v2 Train Script")
+    parser.add_argument("--config", type=str, default="config_7b.yaml", help="Path to config file")
+    parser.add_argument("--warm_start_path", type=str, default=None, help="Optional: Path to HuggingFace model for warm-start initialization")
+    
+    args = parser.parse_args()
+    train(args.config, args.warm_start_path)
