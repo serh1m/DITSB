@@ -224,9 +224,6 @@ def train(config_path, warm_start_path=None):
     last_log_time = start_time
     accumulated_loss = 0.0
     
-    # Initialize Mixed Precision Scaler for memory efficiency
-    scaler = torch.amp.GradScaler('cuda')
-    
     torch.cuda.empty_cache()
     
     for step, batch in enumerate(loader, 1):
@@ -244,7 +241,7 @@ def train(config_path, warm_start_path=None):
         
         optimizer.zero_grad(set_to_none=True) # Memory efficient zeroing
         
-        # Mixed Precision Forward/Backward
+        # Mixed Precision Forward/Backward (BFloat16 natively prevents underflow without a Scaler)
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             # Forward Vector Field 
             logits = model(t, pt)
@@ -252,14 +249,12 @@ def train(config_path, warm_start_path=None):
             # MSE over probability transition derivatives
             loss = matcher.compute_ctmc_loss(logits, x1_onehot, t)
             
-        scaler.scale(loss).backward()
+        loss.backward()
         
         # Address vanishing/exploding gradients in Flow spaces
-        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
         
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         
         accumulated_loss += loss.item()
         
