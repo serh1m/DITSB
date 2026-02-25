@@ -389,14 +389,17 @@ def train(config_path, warm_start_path=None):
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
         
         # Protective Guard: Do not step if gradients exploded to NaN/Inf during BFloat16 transitions
-        if math.isnan(grad_norm) or math.isinf(grad_norm):
-            logger.warning(f"Step {step}: Gradient norm is {grad_norm}. Skipping optimizer step to prevent NaN corruption.")
+        loss_val = loss.item()
+        if math.isnan(grad_norm) or math.isinf(grad_norm) or math.isnan(loss_val) or math.isinf(loss_val):
+            logger.warning(f"Step {step}: NaN/Inf detected (Loss: {loss_val:.2f}, Grad: {grad_norm}). Skipping step metrics and parameter update.")
             optimizer.zero_grad(set_to_none=True)
+            # Rollback step count so we don't advance the sequence towards max_steps on failed tensors
+            step -= 1
+            continue
         else:
             optimizer.step()
             scheduler.step()
-        
-        accumulated_loss += loss.item()
+            accumulated_loss += loss_val
         
         # 4. Detailed Logging
         if step % log_interval == 0:
