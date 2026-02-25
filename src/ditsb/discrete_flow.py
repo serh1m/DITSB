@@ -189,11 +189,17 @@ class CategoricalFlowMatcher(nn.Module):
         """
         uniform_prior = torch.ones_like(x1_onehot) / self.vocab_size
         target_rate = x1_onehot - uniform_prior 
-        probs_theta = torch.nn.functional.softmax(logits_theta, dim=-1)
         
-        # CRITICAL FIX: Sum squared error over vocab dimension (dim=-1) to prevent 1/V vanishing gradients
-        mse_elements = torch.nn.functional.mse_loss(probs_theta, target_rate + uniform_prior, reduction='none')
-        return mse_elements.sum(dim=-1).mean()
+        # In exact Continuous Flow on simplices, the target distribution the model should predict 
+        # is the normalized transition rate. 
+        target_probs = target_rate + uniform_prior   # This simplifies directly to x1_onehot
+        
+        # Use Cross Entropy for robust divergence calculation over a 120k+ vocabulary simplex
+        # (MSE geometrically bounds to ~1.0 and causes vanishing gradients for large dimensions)
+        return torch.nn.functional.cross_entropy(
+            logits_theta.view(-1, self.vocab_size), 
+            target_probs.view(-1, self.vocab_size)
+        )
 
     @torch.no_grad()
     def euler_step_discrete(self, probs: torch.Tensor, logits_theta: torch.Tensor, dt: float) -> torch.Tensor:
