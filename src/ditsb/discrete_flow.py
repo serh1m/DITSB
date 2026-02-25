@@ -180,27 +180,23 @@ class CategoricalFlowMatcher(nn.Module):
         uniform_prior = torch.ones_like(x1_onehot) / self.vocab_size
         return (1 - t) * uniform_prior + t * x1_onehot
 
-    def compute_ctmc_loss(self, logits_theta: torch.Tensor, x1_onehot: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def compute_ctmc_loss(self, logits_theta: torch.Tensor, x1_idx: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         The DITSB-v2 Discrete Flow Training Objective.
         Instead of matching vector field v = x1 - x0,
         We match the predicted transition rate (logits) to the conditional derivative
         of the simplex probability path.
         """
-        uniform_prior = torch.ones_like(x1_onehot) / self.vocab_size
-        target_rate = x1_onehot - uniform_prior 
-        
         # In exact Continuous Flow on simplices, the target distribution the model should predict 
         # is the normalized transition rate. 
-        target_probs = target_rate + uniform_prior   # This simplifies directly to x1_onehot
+        # This formally simplifies to predicting the one-hot target tensor.
         
         # Use Cross Entropy for robust divergence calculation over a 120k+ vocabulary simplex
         # (MSE geometrically bounds to ~1.0 and causes vanishing gradients for large dimensions)
-        # CRITICAL NAN FIX: Force inputs to FP32. BFloat16 internal `log()` will underflow and return `-inf -> NaN` 
-        # when processing tiny probability tails across a massive 128,256 vocabulary dimension.
+        # CRITICAL VRAM FIX: Instead of dense (B, L, V) float matrices (taking 4GB+), we use integer sparse targets directly.
         return torch.nn.functional.cross_entropy(
             logits_theta.view(-1, self.vocab_size).float(), 
-            target_probs.view(-1, self.vocab_size).float()
+            x1_idx.view(-1)
         )
 
     @torch.no_grad()

@@ -70,11 +70,10 @@ def discrete_flow_matching_loss(
 
     # 4. Use the new DITSB-v2 CTMC Exact Flow Loss
     ctmc = CategoricalFlowMatcher(vocab_size).to(device)
-    x1_onehot = F.one_hot(x_1, num_classes=vocab_size).float()
     
-    # We pass logits, onehot, and time (time is not actively used in the simplified v2 base, but kept for signature)
+    # We pass logits, token indices, and time (time is not actively used in the simplified v2 base, but kept for signature)
     t_expanded = t.view(B, 1, 1).expand(B, L, 1)
     
-    loss_unreduced = ctmc.compute_ctmc_loss(logits, x1_onehot, t_expanded)
+    loss_unreduced = ctmc.compute_ctmc_loss(logits, x_1, t_expanded)
 
     return loss_unreduced

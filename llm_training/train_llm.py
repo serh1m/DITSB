@@ -384,12 +384,12 @@ def train(config_path, warm_start_path=None):
         vocab = config['model']['vocab_size']
         
         # 3. Probability Mappings (x1 target, x0 prior)
-        x1_onehot = torch.nn.functional.one_hot(batch, num_classes=vocab).float()
+        x1_onehot = torch.nn.functional.one_hot(batch, num_classes=vocab).to(target_dtype)
         x0_probs = torch.ones_like(x1_onehot) / vocab
         t = torch.rand(B, SeqLen, 1, device=device)
         
         # In actual scale -> perform Sinkhorn alignments
-        pt = matcher.sample_pt(x1_onehot, t)
+        pt = matcher.sample_pt(x1_onehot, t).to(target_dtype)
         
         optimizer.zero_grad(set_to_none=True) # Memory efficient zeroing
         
@@ -399,7 +399,7 @@ def train(config_path, warm_start_path=None):
             logits = model(t, pt)
             
             # CE over probability transition conditionals
-            loss = matcher.compute_ctmc_loss(logits, x1_onehot, t)
+            loss = matcher.compute_ctmc_loss(logits, batch, t)
             
         scaler.scale(loss).backward()
         
