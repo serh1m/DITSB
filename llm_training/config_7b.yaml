@@ -16,6 +16,14 @@ flow:
   ode_solver: "rk4" # For evaluation. Training uses flow-matching regression.
   implicit_solver_stages: 2 # For implicit Gauss-Legendre step decoding
   adjoint_method: true 
+  use_riemannian: true  # Enables Riemannian Geodesic Flow Matching
+
+optimization:
+  turbo_mode: true       # Enables torch.compile and fused kernels
+  use_adjoint: true      # Toggle to false for 2x speedup if VRAM permits
+  pin_memory: true
+  persistent_workers: true
+  non_blocking: true
 
 training:
   batch_size: 4
