@@ -196,9 +196,11 @@ class CategoricalFlowMatcher(nn.Module):
         
         # Use Cross Entropy for robust divergence calculation over a 120k+ vocabulary simplex
         # (MSE geometrically bounds to ~1.0 and causes vanishing gradients for large dimensions)
+        # CRITICAL NAN FIX: Force inputs to FP32. BFloat16 internal `log()` will underflow and return `-inf -> NaN` 
+        # when processing tiny probability tails across a massive 128,256 vocabulary dimension.
         return torch.nn.functional.cross_entropy(
-            logits_theta.view(-1, self.vocab_size), 
-            target_probs.view(-1, self.vocab_size)
+            logits_theta.view(-1, self.vocab_size).float(), 
+            target_probs.view(-1, self.vocab_size).float()
         )
 
     @torch.no_grad()

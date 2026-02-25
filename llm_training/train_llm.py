@@ -300,7 +300,7 @@ def train(config_path, warm_start_path=None):
     
     # Note: On PyTorch 2.x, device context manager prevents host CPU RAM exhaustion
     with torch.device(device):
-        model = DITSBFlowLLaMA(config)
+        model = DITSBFlowLLaMA(config).to(target_dtype)
     
     torch.set_default_dtype(old_dtype) # Restore defaults
     # 2.5 Optional Warm-Start
@@ -386,10 +386,15 @@ def train(config_path, warm_start_path=None):
         loss.backward()
         
         # Address vanishing/exploding gradients in Flow spaces
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
         
-        optimizer.step()
-        scheduler.step()
+        # Protective Guard: Do not step if gradients exploded to NaN/Inf during BFloat16 transitions
+        if math.isnan(grad_norm) or math.isinf(grad_norm):
+            logger.warning(f"Step {step}: Gradient norm is {grad_norm}. Skipping optimizer step to prevent NaN corruption.")
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            optimizer.step()
+            scheduler.step()
         
         accumulated_loss += loss.item()
         
