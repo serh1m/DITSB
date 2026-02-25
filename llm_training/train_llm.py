@@ -57,8 +57,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        variance = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(variance + self.eps) * self.weight
+        input_dtype = x.dtype
+        x_f32 = x.to(torch.float32)
+        variance = x_f32.pow(2).mean(-1, keepdim=True)
+        return self.weight * (x_f32 * torch.rsqrt(variance + self.eps)).to(input_dtype)
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=8192, base=500000.0):
@@ -68,8 +70,8 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(max_position_embeddings, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().bfloat16(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().bfloat16(), persistent=False)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     def forward(self, seq_len):
         return self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(2), self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(2)
@@ -107,6 +109,7 @@ class Attention(nn.Module):
         v = v.view(B, seq_len, self.n_kv_heads, self.head_dim)
         
         cos, sin = self.rotary(seq_len)
+        cos, sin = cos.to(q.dtype), sin.to(q.dtype)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         
         # GQA repeat
