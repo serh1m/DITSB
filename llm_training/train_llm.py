@@ -183,11 +183,23 @@ def train(config_path, warm_start_path=None):
         logger.info("Initializing Warm-Start from pre-trained weights.")
         load_warm_start_weights(model, warm_start_path, device)
     
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=float(config['training']['learning_rate']),
-        weight_decay=float(config['training']['weight_decay'])
-    )
+    # Check for 8-bit Optimizer
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(
+            model.parameters(), 
+            lr=float(config['training']['learning_rate']),
+            weight_decay=float(config['training']['weight_decay'])
+        )
+        logger.info("Equipped bitsandbytes 8-bit AdamW (Massive VRAM Savings)")
+    except ImportError:
+        logger.warning("bitsandbytes not found. Falling back to 32-bit AdamW (High VRAM usage).")
+        optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=float(config['training']['learning_rate']),
+            weight_decay=float(config['training']['weight_decay'])
+        )
+    
     matcher = CategoricalFlowMatcher(vocab_size=config['model']['vocab_size']).to(device)
     
     max_steps = config['training']['max_steps']
@@ -203,6 +215,11 @@ def train(config_path, warm_start_path=None):
     last_log_time = start_time
     accumulated_loss = 0.0
     
+    # Initialize Mixed Precision Scaler for memory efficiency
+    scaler = torch.amp.GradScaler('cuda')
+    
+    torch.cuda.empty_cache()
+    
     for step, batch in enumerate(loader, 1):
         batch = batch.to(device)
         B, SeqLen = batch.shape
@@ -216,19 +233,24 @@ def train(config_path, warm_start_path=None):
         # In actual scale -> perform Sinkhorn alignments
         pt = matcher.sample_pt(x1_onehot, t)
         
-        # Forward Vector Field 
-        logits = model(t, pt)
+        optimizer.zero_grad(set_to_none=True) # Memory efficient zeroing
         
-        # MSE over probability transition derivatives
-        loss = matcher.compute_ctmc_loss(logits, x1_onehot, t)
-        
-        optimizer.zero_grad()
-        loss.backward()
+        # Mixed Precision Forward/Backward
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            # Forward Vector Field 
+            logits = model(t, pt)
+            
+            # MSE over probability transition derivatives
+            loss = matcher.compute_ctmc_loss(logits, x1_onehot, t)
+            
+        scaler.scale(loss).backward()
         
         # Address vanishing/exploding gradients in Flow spaces
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
         
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         
         accumulated_loss += loss.item()
         
