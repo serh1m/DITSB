@@ -270,7 +270,8 @@ def train(config_path, warm_start_path=None):
             eta = calculate_eta(elapsed, step, max_steps)
             
             # Predict PPL equivalently (approx based on flow CE equivalence)
-            approx_ppl = math.exp(min(avg_loss * vocab, 100)) # roughly translating categorical flow loss to cross-entropy bounds
+            # Since loss is now sum-reduced over the vocab simplex, avg_loss mathematically aligns with discrete entropy limits
+            approx_ppl = math.exp(min(avg_loss, 100)) 
             
             logger.info(
                 f"Step {step:6d}/{max_steps} | "

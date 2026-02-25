@@ -190,7 +190,10 @@ class CategoricalFlowMatcher(nn.Module):
         uniform_prior = torch.ones_like(x1_onehot) / self.vocab_size
         target_rate = x1_onehot - uniform_prior 
         probs_theta = torch.nn.functional.softmax(logits_theta, dim=-1)
-        return torch.nn.functional.mse_loss(probs_theta, target_rate + uniform_prior)
+        
+        # CRITICAL FIX: Sum squared error over vocab dimension (dim=-1) to prevent 1/V vanishing gradients
+        mse_elements = torch.nn.functional.mse_loss(probs_theta, target_rate + uniform_prior, reduction='none')
+        return mse_elements.sum(dim=-1).mean()
 
     @torch.no_grad()
     def euler_step_discrete(self, probs: torch.Tensor, logits_theta: torch.Tensor, dt: float) -> torch.Tensor:
