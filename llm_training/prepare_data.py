@@ -9,17 +9,13 @@ def prepare_data(args):
     # We use a reliable default dataset if openwebtext is too large to test.
     # Users can pass --dataset "Salesforce/wikitext" or any valid HF dataset.
     try:
-        # Default to wikitext-2-raw-v1 if dataset arg is simply 'wikitext'
-        if args.dataset == 'wikitext':
+        if args.dataset == 'wikitext' or "tiny_shakespeare" in args.dataset:
             dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-        elif args.dataset == "tiny_shakespeare" or args.dataset == "Trelis/tiny_shakespeare":
-            # Tiny shakespeare is hosted under a different namespace now in datasets
-            dataset = load_dataset("karpathy/tiny_shakespeare", split="train")
         else:
             dataset = load_dataset(args.dataset, split="train")
     except Exception as e:
-        print(f"Error loading {args.dataset}, falling back to karpathy/tiny_shakespeare: {e}")
-        dataset = load_dataset("karpathy/tiny_shakespeare", split="train")
+        print(f"Error loading {args.dataset}, falling back to stable wikitext-2-raw-v1: {e}")
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
     print(f"Loading tokenizer: {args.tokenizer_name}")
     # Using a typical BPE tokenizer
