@@ -117,9 +117,9 @@ class Attention(nn.Module):
         k = k[:, :, :, None, :].expand(B, seq_len, self.n_kv_heads, n_rep, self.head_dim).reshape(B, seq_len, self.n_heads, self.head_dim)
         v = v[:, :, :, None, :].expand(B, seq_len, self.n_kv_heads, n_rep, self.head_dim).reshape(B, seq_len, self.n_heads, self.head_dim)
         
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
         
         # No causal mask for bidirectional continuous flow!
         attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
@@ -193,8 +193,12 @@ class DITSBFlowLLaMA(nn.Module):
         t_emb = self.time_embed(t_vec)
         x = x + t_emb
         
+        from torch.utils.checkpoint import checkpoint
         for block in self.blocks:
-            x = block(x)
+            if self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
             
         x = self.norm(x)
         logits = self.lm_head(x)
